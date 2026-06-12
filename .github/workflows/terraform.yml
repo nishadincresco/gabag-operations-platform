@@ -1,0 +1,167 @@
+name: Terraform
+
+on:
+  push:
+    branches: [main, dev]
+    paths:
+      - "terraform/**"
+      - ".github/workflows/terraform.yml"
+  pull_request:
+    branches: [main, dev]
+    paths:
+      - "terraform/**"
+      - ".github/workflows/terraform.yml"
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: Environment to plan/apply
+        required: true
+        default: dev
+        type: choice
+        options:
+          - shared
+          - dev
+          - prod
+
+permissions:
+  contents: read
+  pull-requests: write
+
+jobs:
+  shared:
+    name: Terraform (shared)
+    if: github.event_name != 'workflow_dispatch' || github.event.inputs.environment == 'shared'
+    runs-on: ubuntu-latest
+    env:
+      TF_WORKING_DIR: ./terraform/envs/shared
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: "1.7.0"
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID || secrets.S3_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY || secrets.S3_SECRET_ACCESS_KEY }}
+          aws-region: eu-west-1
+
+      - name: Terraform Format
+        run: terraform fmt -check -recursive terraform/
+
+      - name: Terraform Init
+        working-directory: ${{ env.TF_WORKING_DIR }}
+        run: terraform init
+
+      - name: Terraform Plan
+        working-directory: ${{ env.TF_WORKING_DIR }}
+        env:
+          TF_VAR_db_password: ${{ secrets.DB_PASSWORD }}
+        run: terraform plan -no-color -input=false
+
+      - name: Terraform Apply
+        if: github.event_name == 'push' && (github.ref == 'refs/heads/dev' || github.ref == 'refs/heads/main')
+        working-directory: ${{ env.TF_WORKING_DIR }}
+        env:
+          TF_VAR_db_password: ${{ secrets.DB_PASSWORD }}
+        run: terraform apply -auto-approve -input=false
+
+  matrix-prep:
+    name: Matrix (terraform envs)
+    needs: shared
+    if: >-
+      always() &&
+      !cancelled() &&
+      (needs.shared.result == 'success' || needs.shared.result == 'skipped')
+    runs-on: ubuntu-latest
+    outputs:
+      include: ${{ steps.matrix.outputs.include }}
+      has_terraform: ${{ steps.matrix.outputs.has_terraform }}
+    steps:
+      - id: matrix
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          ENV_INPUT: ${{ github.event.inputs.environment }}
+        run: |
+          BOTH='[{"environment":"dev","apply_branch":"refs/heads/dev","amplify_web_url":"https://dev.gabag-operations-platform.example.com"},{"environment":"prod","apply_branch":"refs/heads/main","amplify_web_url":"https://gabag-operations-platform.example.com"}]'
+          DEV_ONLY='[{"environment":"dev","apply_branch":"refs/heads/dev","amplify_web_url":"https://dev.gabag-operations-platform.example.com"}]'
+          PROD_ONLY='[{"environment":"prod","apply_branch":"refs/heads/main","amplify_web_url":"https://gabag-operations-platform.example.com"}]'
+          EMPTY='[]'
+
+          if [ "$EVENT_NAME" = "workflow_dispatch" ]; then
+            case "$ENV_INPUT" in
+              dev)  json="$DEV_ONLY" ;;
+              prod) json="$PROD_ONLY" ;;
+              *)    json="$EMPTY" ;;
+            esac
+          else
+            json="$BOTH"
+          fi
+
+          if [ "$json" = "$EMPTY" ]; then
+            echo "has_terraform=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "has_terraform=true" >> "$GITHUB_OUTPUT"
+          fi
+
+          {
+            echo 'include<<__MATRIX_JSON__'
+            echo "$json"
+            echo '__MATRIX_JSON__'
+          } >> "$GITHUB_OUTPUT"
+
+  terraform:
+    name: Terraform (${{ matrix.environment }})
+    needs: [shared, matrix-prep]
+    if: >-
+      always() &&
+      !cancelled() &&
+      (needs.shared.result == 'success' || needs.shared.result == 'skipped') &&
+      needs.matrix-prep.outputs.has_terraform == 'true'
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include: ${{ fromJSON(needs.matrix-prep.outputs.include) }}
+
+    env:
+      TF_WORKING_DIR: ./terraform/envs/${{ matrix.environment }}
+      TF_VAR_db_password: ${{ secrets.DB_PASSWORD }}
+      TF_VAR_auth_secret: ${{ secrets.AUTH_SECRET }}
+      TF_VAR_cron_secret: ${{ secrets.CRON_SECRET }}
+      TF_VAR_s3_access_key_id: ${{ secrets.S3_ACCESS_KEY_ID }}
+      TF_VAR_s3_secret_access_key: ${{ secrets.S3_SECRET_ACCESS_KEY }}
+      TF_VAR_amplify_web_url: ${{ matrix.amplify_web_url }}
+      TF_VAR_github_access_token: ${{ matrix.environment == 'dev' && secrets.GITHUB_ACCESS_TOKEN || '' }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: "1.7.0"
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID || secrets.S3_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY || secrets.S3_SECRET_ACCESS_KEY }}
+          aws-region: eu-west-1
+
+      - name: Terraform Init
+        working-directory: ${{ env.TF_WORKING_DIR }}
+        run: terraform init
+
+      - name: Terraform Plan
+        working-directory: ${{ env.TF_WORKING_DIR }}
+        run: terraform plan -no-color -input=false
+
+      - name: Terraform Apply
+        if: ${{ github.event_name == 'push' && github.ref == matrix.apply_branch }}
+        working-directory: ${{ env.TF_WORKING_DIR }}
+        run: terraform apply -auto-approve -input=false

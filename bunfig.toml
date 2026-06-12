@@ -1,0 +1,5 @@
+# Amplify Hosting requires a flat node_modules layout (like pnpm's `node-linker=hoisted`).
+# Bun's default "isolated" linker uses a `.bun` symlink store that breaks Amplify's
+# WEB_COMPUTE deps detection ("node_modules folder is missing the 'next' dependency").
+[install]
+linker = "hoisted"

@@ -1,0 +1,114 @@
+version: 1
+applications:
+  - appRoot: apps/web
+    frontend:
+      buildPath: /
+      phases:
+        preBuild:
+          commands:
+            - echo "===== [preBuild] Starting ====="
+            - export REPO_ROOT="$(git rev-parse --show-toplevel)"
+            - cd "$REPO_ROOT"
+            - corepack enable
+            - npm install -g bun
+            # Hoisted linker (via bunfig.toml) places top-level deps at <root>/node_modules
+            - bun install --frozen-lockfile --linker=hoisted
+            - echo "===== [preBuild] Prisma Generate ====="
+            - test -n "$DATABASE_URL" || (echo "ERROR Set DATABASE_URL in Amplify Environment variables (Terraform or Console)" && exit 1)
+            - export DIRECT_URL="${DIRECT_URL:-$DATABASE_URL}"
+            - cd "$REPO_ROOT/packages/db" && bun x prisma generate
+            - echo "===== [preBuild] Done ====="
+        build:
+          commands:
+            - echo "===== [build] Starting ====="
+            - export REPO_ROOT="$(git rev-parse --show-toplevel)"
+            - export WEB_ROOT="$REPO_ROOT/apps/web"
+            - cd "$REPO_ROOT"
+            # Stale cache may leave mirrored @repo symlinks (old exports → src/*.ts) and break Turbopack.
+            - rm -rf "$WEB_ROOT/node_modules" "$REPO_ROOT/packages/types/dist"
+            # Amplify SSR: Next.js cannot read Console env at runtime unless they are
+            # written to .env.production before build (AWS SSR env vars guide).
+            - |
+              node <<'NODE'
+              const fs = require("fs");
+              const path = require("path");
+              const webRoot = process.env.WEB_ROOT;
+              if (!webRoot) {
+                console.error("ERROR WEB_ROOT is not set");
+                process.exit(1);
+              }
+              const keys = [
+                "DATABASE_URL", "DIRECT_URL", "AUTH_SECRET", "NEXTAUTH_SECRET", "AUTH_TRUST_HOST",
+                "NEXTAUTH_URL", "AUTH_URL", "NEXT_PUBLIC_APP_URL",
+                "S3_ACCESS_KEY_ID", "S3_SECRET_ACCESS_KEY", "S3_REGION",
+                "S3_BUCKET_NAME", "S3_PUBLIC_URL", "CRON_SECRET", "NODE_ENV",
+              ];
+              const lines = [];
+              for (const key of keys) {
+                const value = process.env[key];
+                if (value) lines.push(`${key}=${JSON.stringify(value)}`);
+              }
+              if (!process.env.DATABASE_URL) {
+                console.error("ERROR DATABASE_URL missing in Amplify build environment");
+                process.exit(1);
+              }
+              const out = path.join(webRoot, ".env.production");
+              fs.writeFileSync(out, lines.join("\n") + "\n");
+              console.log(`Wrote ${lines.length} server env vars to ${out}`);
+              NODE
+            # @repo/types must emit dist/ before Next (package exports point at dist, not src).
+            - bun x turbo run build --filter=@repo/types --force
+            - test -f "$REPO_ROOT/packages/types/dist/index.js" || (echo "ERROR @repo/types dist missing" && exit 1)
+            # Cached node_modules may copy an incomplete @repo/types (barrel d.ts without validations/).
+            - rm -rf "$REPO_ROOT/node_modules/@repo/types"
+            - ln -sfn "$REPO_ROOT/packages/types" "$REPO_ROOT/node_modules/@repo/types"
+            - bun x turbo run build --filter=web --force
+            - test -f "$WEB_ROOT/.next/required-server-files.json" || (echo "ERROR missing required-server-files.json" && exit 1)
+            # Shrink artifact (230MB limit): drop cache/standalone; add minimal Prisma runtime only.
+            - |
+              set -euo pipefail
+              rm -rf "$WEB_ROOT/.next/cache" "$WEB_ROOT/.next/standalone"
+              ARTIFACT_NM="$WEB_ROOT/.next/node_modules"
+              mkdir -p "$ARTIFACT_NM/@prisma"
+              cp -a "$REPO_ROOT/node_modules/.prisma" "$ARTIFACT_NM/.prisma"
+              for pkg in client adapter-pg client-runtime-utils driver-adapter-utils; do
+                rm -rf "$ARTIFACT_NM/@prisma/$pkg"
+                cp -a "$REPO_ROOT/node_modules/@prisma/$pkg" "$ARTIFACT_NM/@prisma/$pkg"
+              done
+              cp -a "$REPO_ROOT/node_modules/pg" "$ARTIFACT_NM/pg"
+              if [ -d "$REPO_ROOT/node_modules/bcryptjs" ]; then
+                cp -a "$REPO_ROOT/node_modules/bcryptjs" "$ARTIFACT_NM/bcryptjs"
+              fi
+              for HASH_PKG in $(grep -roh '@prisma/client-[a-f0-9]\{16,\}' "$WEB_ROOT/.next/server" 2>/dev/null | sort -u); do
+                NAME="${HASH_PKG#@prisma/}"
+                echo "Symlink @prisma/$NAME -> client"
+                ln -sfn client "$ARTIFACT_NM/@prisma/$NAME"
+              done
+              test -d "$ARTIFACT_NM/.prisma/client" || (echo "ERROR Prisma client missing in .next/node_modules" && exit 1)
+              # @prisma/client/runtime ships WASM for every DB (~75MB); keep PostgreSQL only.
+              RUNTIME="$ARTIFACT_NM/@prisma/client/runtime"
+              if [ -d "$RUNTIME" ]; then
+                find "$RUNTIME" -name '*.map' -delete
+                find "$RUNTIME" -name 'index-browser.*' -delete
+                find "$RUNTIME" -name 'query_compiler_*' ! -name '*postgresql*' -delete
+              fi
+              rm -rf "$ARTIFACT_NM/@prisma/client/generator-build"
+              rm -rf "$WEB_ROOT/.next/trace" "$WEB_ROOT/.next/diagnostics" "$WEB_ROOT/.next/trace-build"
+              find "$WEB_ROOT/.next/server" -name '*.map' -delete 2>/dev/null || true
+              echo "Artifact node_modules size: $(du -sh "$ARTIFACT_NM" | cut -f1)"
+              echo "Artifact .next size: $(du -sh "$WEB_ROOT/.next" | cut -f1)"
+            # Amplify preflight checks appRoot/node_modules/next only.
+            - mkdir -p "$WEB_ROOT/node_modules"
+            - ln -sfn "$REPO_ROOT/node_modules/next" "$WEB_ROOT/node_modules/next"
+            - test -e "$WEB_ROOT/node_modules/next/package.json" || (echo "ERROR node_modules/next not found at repo root" && exit 1)
+            - echo "===== [build] Done ====="
+      artifacts:
+        baseDirectory: apps/web/.next
+        files:
+          - "**/*"
+      cache:
+        paths:
+          - node_modules/**/*
+          - node_modules/.prisma/**/*
+          - apps/web/.next/cache/**/*
+          - ~/.bun/install/cache/**/*

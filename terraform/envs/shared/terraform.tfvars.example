@@ -1,0 +1,17 @@
+aws_region    = "eu-west-1"
+backup_region = "eu-west-1"
+
+dev_database_name  = "gabag_operations_platform_dev"
+prod_database_name = "gabag_operations_platform_prod"
+
+# Secrets (do not commit; provide via TF_VAR_db_password)
+# db_password = "..."
+
+# RDS sizing — tune per project
+rds_instance_class          = "db.t4g.small"
+rds_allocated_storage       = 50
+rds_max_allocated_storage   = 200
+rds_multi_az                = false
+rds_publicly_accessible     = true
+rds_backup_retention_period = 14
+rds_deletion_protection     = true
